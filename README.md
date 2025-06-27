@@ -135,7 +135,7 @@ void monitor_input(unsigned int portId) {
 
 For further reading please refer here:
 
-*   **[Full API Documentation (DOCUMENTATION.md)](DOCUMENTATION.md)**
+*   **[Documentation](DOCUMENTATION.md)**
 
 
 ## Building the Test Application
