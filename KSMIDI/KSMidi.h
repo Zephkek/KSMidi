@@ -124,9 +124,12 @@ namespace ksmidi {
         using ErrorCallback = std::function<void(const KsMidiError& error)>;
 
         struct Settings {
-            DWORD bufferSize = 1024;        // Size of each individual I/O buffer
+            DWORD bufferSize = 512;        // Size of each individual I/O buffer
             unsigned int bufferCount = 4;   // Number of I/O buffers to use (min 2)
             size_t sysexChunkSize = 1024;   // Size for splitting large SysEx messages in callbacks (0 to disable)
+            bool ignoreSysex = true;        // Initially ignore SysEx messages
+            bool ignoreTime = true;         // Initially ignore Timing Clock and Start/Stop/Continue messages
+            bool ignoreSense = true;        // Initially ignore Active Sensing and System Reset messages
         };
 
         MidiIn();
