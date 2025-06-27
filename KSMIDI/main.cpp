@@ -1,4 +1,4 @@
-﻿/*
+/*
     KSMidi Test App – main.cpp
     ---------------------------
     Author: Mohamed Maatallah
@@ -67,7 +67,7 @@ void printMessage(const ksmidi::MidiMessage& msg) {
 
     switch (high_nibble) {
     case 0x80: std::cout << "Note Off (Ch " << static_cast<int>(channel) << ", Key " << static_cast<int>(msg.bytes[1]) << ", Vel " << static_cast<int>(msg.bytes[2]) << ")\n"; break;
-    case 0x90: std::cout << (msg.bytes[2] > 0 ? "Note On  " : "Note Off ") << "(Ch " << static_cast<int>(channel) << ", Key " << static_cast<int>(msg.bytes[1]) << ", Vel " << static_cast<int>(msg.bytes[2]) << ")\n"; break;
+    case 0x90: std::cout << (msg.bytes.size() > 2 && msg.bytes[2] > 0 ? "Note On  " : "Note Off ") << "(Ch " << static_cast<int>(channel) << ", Key " << static_cast<int>(msg.bytes[1]) << ", Vel " << (msg.bytes.size() > 2 ? static_cast<int>(msg.bytes[2]) : 0) << ")\n"; break;
     case 0xA0: std::cout << "Aftertouch (Ch " << static_cast<int>(channel) << ", Key " << static_cast<int>(msg.bytes[1]) << ", Pressure " << static_cast<int>(msg.bytes[2]) << ")\n"; break;
     case 0xB0: std::cout << "CC       (Ch " << static_cast<int>(channel) << ", Ctl " << static_cast<int>(msg.bytes[1]) << ", Val " << static_cast<int>(msg.bytes[2]) << ")\n"; break;
     case 0xC0: std::cout << "Program Change (Ch " << static_cast<int>(channel) << ", Pgm " << static_cast<int>(msg.bytes[1]) << ")\n"; break;
@@ -247,7 +247,7 @@ void testMidiIn() {
         char use_defaults;
         std::cin >> use_defaults;
         if (use_defaults != 'y' && use_defaults != 'Y') {
-            std::cout << "Enter buffer size (default 1024): ";
+            std::cout << "Enter buffer size (default 512): ";
             std::cin >> settings.bufferSize;
             std::cout << "Enter buffer count (default 4, min 2): ";
             std::cin >> settings.bufferCount;
@@ -273,13 +273,13 @@ void testMidiIn() {
             if (choice == 0) break;
 
             switch (choice) {
-            case 1: { 
+            case 1: {
                 printHeader("Callback Monitoring");
                 std::cout << "Press 's' to toggle SysEx, 't' for Time, 'n' for Sense.\n"
                     << "Press any other key to stop.\n\n";
                 midiIn.setCallback(&printMessage);
 
-                bool s = false, t = false, n = false;
+                bool s = true, t = true, n = true;
                 midiIn.ignoreTypes(s, t, n);
                 std::cout << "Current filters: SysEx=" << s << " Time=" << t << " Sense=" << n << "\n";
 
@@ -297,7 +297,7 @@ void testMidiIn() {
                             }
                         }
                         else {
-                            break; 
+                            break;
                         }
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -317,10 +317,10 @@ void testMidiIn() {
 
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
-                _getch(); 
+                (void)_getch(); 
                 break;
             }
-            case 3: { 
+            case 3: {
                 printHeader("Error Handling Test");
                 std::cout << "Listening for messages. Please unplug the MIDI device now to trigger an error...\n"
                     << "Press any key to stop.\n\n";
@@ -328,7 +328,7 @@ void testMidiIn() {
                 while (!_kbhit()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
-                _getch();
+                (void)_getch();
                 midiIn.cancelCallback();
                 break;
             }
