@@ -25,14 +25,6 @@
 
 // Aligns a value up to the nearest alignment boundary.
 #define KS_ALIGN_UP(v, a) (((v) + (a) - 1) & ~((a) - 1))
-
-#ifdef KSMIDI_DEBUG
-#   include <iostream>
-#   define TRACE(x) do { std::wostringstream _os; _os << L"[KSMIDI] " << x << L'\n'; OutputDebugStringW(_os.str().c_str()); } while(0)
-#else
-#   define TRACE(x) do {} while(0)
-#endif
-
 namespace ksmidi {
     namespace internal {
 
@@ -523,7 +515,6 @@ namespace ksmidi {
 
     private:
         void pollingLoop() {
-            TRACE(L"Callback poller thread started.");
             MidiMessage msg;
             KsMidiError err;
             while (!stop_polling_) {
@@ -537,11 +528,9 @@ namespace ksmidi {
                     if (error_callback_) error_callback_(err);
                 }
             }
-            TRACE(L"Callback poller thread exiting.");
         }
 
         void readerLoop() {
-            TRACE(L"I/O reader thread started.");
             std::vector<std::unique_ptr<ReadRequest>> requests;
             std::vector<HANDLE> events;
             for (unsigned int i = 0; i < settings_.bufferCount; ++i) {
@@ -574,7 +563,6 @@ namespace ksmidi {
                     break;
                 }
             }
-            TRACE(L"I/O reader thread exiting.");
         }
 
         bool queueRead(ReadRequest& req) {
