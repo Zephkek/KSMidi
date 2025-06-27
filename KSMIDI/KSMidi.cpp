@@ -41,6 +41,7 @@ namespace ksmidi {
         struct DevInfoDeleter { void operator()(HDEVINFO h) const { if (h && h != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(h); } };
         using UniqueDevInfo = std::unique_ptr<std::remove_pointer_t<HDEVINFO>, DevInfoDeleter>;
 
+        // Formats a Windows error code into a human-readable string.
         static std::string FormatWinError(HRESULT err) {
             char* msg = nullptr;
             FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -293,48 +294,39 @@ namespace ksmidi {
         void openPort(unsigned int portNumber) {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             closePort();
+            DeviceInfo info = Api::getPortInfoOut(portNumber);
+            if (!info.isAvailable) throw KsMidiError("Output port '" + info.name + "' is not available.", E_ACCESSDENIED);
 
-            try {
-                DeviceInfo info = Api::getPortInfoOut(portNumber);
-                if (!info.isAvailable) throw KsMidiError("Output port '" + info.name + "' is not available.", E_ACCESSDENIED);
+            filter_.reset(CreateFileW(info.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
 
-                filter_.reset(CreateFileW(info.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
-                if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
+            const size_t connectSize = sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT);
+            std::vector<BYTE> connectBuffer(connectSize);
+            auto* connect = reinterpret_cast<PKSPIN_CONNECT>(connectBuffer.data());
+            auto* dataFormat = reinterpret_cast<PKSDATAFORMAT>(connect + 1);
 
-                const size_t connectSize = sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT);
-                std::vector<BYTE> connectBuffer(connectSize);
-                auto* connect = reinterpret_cast<PKSPIN_CONNECT>(connectBuffer.data());
-                auto* dataFormat = reinterpret_cast<PKSDATAFORMAT>(connect + 1);
+            connect->Interface = { KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_STREAMING, 0 };
+            connect->Medium = { KSMEDIUMSETID_Standard, 0, 0 };
+            connect->PinId = info.pinId;
+            connect->PinToHandle = nullptr;
+            connect->Priority = { KSPRIORITY_NORMAL, 1 };
+            *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
 
-                connect->Interface = { KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_STREAMING, 0 };
-                connect->Medium = { KSMEDIUMSETID_Standard, 0, 0 };
-                connect->PinId = info.pinId;
-                connect->PinToHandle = nullptr;
-                connect->Priority = { KSPRIORITY_NORMAL, 1 };
-                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+            HANDLE rawPinHandle = nullptr;
+            HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_WRITE, &rawPinHandle);
+            if (FAILED(hr)) throw KsMidiError("Failed to create output pin.", hr);
 
-                HANDLE rawPinHandle = nullptr;
-                HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_WRITE, &rawPinHandle);
-                if (FAILED(hr)) throw KsMidiError("Failed to create output pin.", hr);
-
-                pin_.reset(rawPinHandle);
-                ensurePinStopped();
-                setPinState(KSSTATE_ACQUIRE);
-                setPinState(KSSTATE_RUN);
-                writeBuffer_.resize(2048);
-            }
-            catch (...) {
-                if (pin_) { try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {} }
-                pin_.reset();
-                filter_.reset();
-                throw;
-            }
+            pin_.reset(rawPinHandle);
+            setPinState(KSSTATE_ACQUIRE);
+            setPinState(KSSTATE_RUN);
+            writeBuffer_.resize(2048);
         }
 
         void closePort() {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
             if (!pin_) return;
-            ensurePinStopped();
+            try { setPinState(KSSTATE_STOP); }
+            catch (const KsMidiError&) {}
             pin_.reset();
             filter_.reset();
         }
@@ -369,16 +361,6 @@ namespace ksmidi {
             DWORD bytesReturned = 0;
             if (!DeviceIoControl(pin_.get(), IOCTL_KS_PROPERTY, &prop, sizeof(prop), &state, sizeof(state), &bytesReturned, nullptr)) {
                 if (state != KSSTATE_STOP) throw KsMidiError("Failed to set pin state", static_cast<HRESULT>(GetLastError()));
-            }
-        }
-
-        void ensurePinStopped() {
-            if (!pin_) return;
-            KSSTATE current = KSSTATE_STOP;
-            KSPROPERTY prop{ KSPROPSETID_Connection, KSPROPERTY_CONNECTION_STATE, KSPROPERTY_TYPE_GET };
-            DWORD bytesReturned = 0;
-            if (!DeviceIoControl(pin_.get(), IOCTL_KS_PROPERTY, &prop, sizeof(prop), &current, sizeof(current), &bytesReturned, nullptr) || current != KSSTATE_STOP) {
-                try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {}
             }
         }
 
@@ -423,65 +405,55 @@ namespace ksmidi {
             if (settings.bufferCount < 2) throw KsMidiError("Buffer count must be at least 2.", E_INVALIDARG);
             closePort();
 
-            try {
-                settings_ = settings;
-                info_ = Api::getPortInfoIn(portNumber);
-                if (!info_.isAvailable) throw KsMidiError("Input port '" + info_.name + "' is not available.", E_ACCESSDENIED);
+            settings_ = settings;
+            info_ = Api::getPortInfoIn(portNumber);
+            if (!info_.isAvailable) throw KsMidiError("Input port '" + info_.name + "' is not available.", E_ACCESSDENIED);
 
-                callback_signal_event_.reset(CreateEvent(nullptr, FALSE, FALSE, nullptr));
-                if (!callback_signal_event_) throw KsMidiError("Failed to create callback event.", static_cast<HRESULT>(GetLastError()));
+            callback_signal_event_.reset(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+            if (!callback_signal_event_) throw KsMidiError("Failed to create callback event.", static_cast<HRESULT>(GetLastError()));
 
-                filter_.reset(CreateFileW(info_.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
-                if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
+            filter_.reset(CreateFileW(info_.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
+            if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
 
-                const size_t connectSize = sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT);
-                std::vector<BYTE> connectBuffer(connectSize);
-                auto* connect = reinterpret_cast<PKSPIN_CONNECT>(connectBuffer.data());
-                auto* dataFormat = reinterpret_cast<PKSDATAFORMAT>(connect + 1);
+            const size_t connectSize = sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT);
+            std::vector<BYTE> connectBuffer(connectSize);
+            auto* connect = reinterpret_cast<PKSPIN_CONNECT>(connectBuffer.data());
+            auto* dataFormat = reinterpret_cast<PKSDATAFORMAT>(connect + 1);
 
-                connect->Interface = { KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_STREAMING, 0 };
-                connect->Medium = { KSMEDIUMSETID_Standard, 0, 0 };
-                connect->PinId = info_.pinId;
-                connect->PinToHandle = nullptr;
-                connect->Priority = { KSPRIORITY_NORMAL, 1 };
-                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+            connect->Interface = { KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_STREAMING, 0 };
+            connect->Medium = { KSMEDIUMSETID_Standard, 0, 0 };
+            connect->PinId = info_.pinId;
+            connect->PinToHandle = nullptr;
+            connect->Priority = { KSPRIORITY_NORMAL, 1 };
+            *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
 
-                HANDLE rawPinHandle = nullptr;
-                HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_READ, &rawPinHandle);
-                if (FAILED(hr)) throw KsMidiError("Failed to create input pin.", hr);
+            HANDLE rawPinHandle = nullptr;
+            HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_READ, &rawPinHandle);
+            if (FAILED(hr)) throw KsMidiError("Failed to create input pin.", hr);
 
-                pin_.reset(rawPinHandle);
-                ensurePinStopped();
-                setPinState(KSSTATE_ACQUIRE);
-                setPinState(KSSTATE_RUN);
+            pin_.reset(rawPinHandle);
+            setPinState(KSSTATE_ACQUIRE);
+            setPinState(KSSTATE_RUN);
 
-                parser_.config.sysexChunkSize = settings_.sysexChunkSize;
-                QueryPerformanceFrequency(&perf_freq_);
-                stop_flag_ = false;
-                reader_thread_ = std::thread(&MidiInImpl::readerLoop, this);
-            }
-            catch (...) {
-                stop_flag_ = true;
-                if (pin_) { try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {} }
-                pin_.reset();
-                filter_.reset();
-                callback_signal_event_.reset();
-                throw;
-            }
+            parser_.config.sysexChunkSize = settings_.sysexChunkSize;
+            QueryPerformanceFrequency(&perf_freq_);
+            stop_flag_ = false;
+            reader_thread_ = std::thread(&MidiInImpl::readerLoop, this);
         }
 
         void closePort() {
             std::lock_guard<std::recursive_mutex> lock(mutex_);
+            if (stop_flag_.load(std::memory_order_relaxed) || !reader_thread_.joinable()) return;
+
             stop_flag_ = true;
             cancelCallback();
 
             if (pin_) CancelIoEx(pin_.get(), nullptr);
             if (reader_thread_.joinable()) reader_thread_.join();
 
-            if (pin_) ensurePinStopped();
+            if (pin_) { try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {} }
             pin_.reset();
             filter_.reset();
-            callback_signal_event_.reset();
         }
 
         void setCallback(MessageCallback callback) {
@@ -609,16 +581,6 @@ namespace ksmidi {
             DWORD bytesReturned = 0;
             if (!DeviceIoControl(pin_.get(), IOCTL_KS_PROPERTY, &prop, sizeof(prop), &state, sizeof(state), &bytesReturned, nullptr)) {
                 if (state != KSSTATE_STOP) throw KsMidiError("Failed to set pin state", static_cast<HRESULT>(GetLastError()));
-            }
-        }
-
-        void ensurePinStopped() {
-            if (!pin_) return;
-            KSSTATE current = KSSTATE_STOP;
-            KSPROPERTY prop{ KSPROPSETID_Connection, KSPROPERTY_CONNECTION_STATE, KSPROPERTY_TYPE_GET };
-            DWORD bytesReturned = 0;
-            if (!DeviceIoControl(pin_.get(), IOCTL_KS_PROPERTY, &prop, sizeof(prop), &current, sizeof(current), &bytesReturned, nullptr) || current != KSSTATE_STOP) {
-                try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {}
             }
         }
 
