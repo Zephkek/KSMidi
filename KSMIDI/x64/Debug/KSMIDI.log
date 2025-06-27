@@ -1,0 +1,6 @@
+﻿  KSMidi.cpp
+C:\Users\Zeph\source\repos\KSMIDI\KSMIDI\KSMidi.cpp(230,131): warning C4267: 'return': conversion from 'size_t' to 'unsigned int', possible loss of data
+C:\Users\Zeph\source\repos\KSMIDI\KSMIDI\KSMidi.cpp(231,130): warning C4267: 'return': conversion from 'size_t' to 'unsigned int', possible loss of data
+  main.cpp
+  Generating Code...
+  KSMIDI.vcxproj -> C:\Users\Zeph\source\repos\KSMIDI\x64\Debug\KSMIDI.exe
