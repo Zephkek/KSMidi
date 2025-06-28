@@ -25,6 +25,7 @@
 
 // Aligns a value up to the nearest alignment boundary.
 #define KS_ALIGN_UP(v, a) (((v) + (a) - 1) & ~((a) - 1))
+
 namespace ksmidi {
     namespace internal {
 
