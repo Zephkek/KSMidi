@@ -8,13 +8,6 @@
 */
 
 #pragma once
-
-#ifdef KSMIDI_DEBUG
-#ifndef _DEBUG
-#define _DEBUG
-#endif
-#endif
-
 #define NOMINMAX
 #include <windows.h>
 #include <string>
