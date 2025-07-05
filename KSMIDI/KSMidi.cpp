@@ -2,7 +2,8 @@
     KSMidi Core Implementation – KSMidi.cpp
     ---------------------------------------
     Author: Mohamed Maatallah
-    Date: June 27, 2025 (Refactored for Performance)
+    Date: June 28, 2025 (The Final Form)
+    Modification: Added full MIDI 2.0 / UMP support with a dedicated UMP parser and API.
 
     This is the full internal implementation of the KSMidi library,
     responsible for interfacing directly with Windows Kernel Streaming (KS)
@@ -14,14 +15,19 @@
 #include <initguid.h>
 #include <ks.h>
 #include <ksmedia.h>
+#include <avrt.h> // For MMCSS
 #include <vector>
 #include <sstream>
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <array>
+#include <utility>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "ksuser.lib")
+#pragma comment(lib, "avrt.lib") 
+
 
 // Aligns a value up to the nearest alignment boundary.
 #define KS_ALIGN_UP(v, a) (((v) + (a) - 1) & ~((a) - 1))
@@ -47,6 +53,21 @@ namespace ksmidi {
             return os.str();
         }
 
+        // --- MIDI 1.0 Byte Stream Parser ---
+        namespace {
+            constexpr std::array<uint8_t, 256> kBytesNeeded = [] {
+                std::array<uint8_t, 256> t{};
+                for (int s = 0; s < 256; ++s) {
+                    uint8_t b = 0;
+                    const uint8_t nibble = s & 0xF0;
+                    if (nibble == 0xC0 || nibble == 0xD0 || s == 0xF1 || s == 0xF3) b = 1;
+                    else if ((nibble >= 0x80 && nibble <= 0xE0) || s == 0xF2) b = 2;
+                    t[s] = b;
+                }
+                return t;
+                }();
+        }
+
         class MidiParser {
         public:
             struct Config {
@@ -55,16 +76,12 @@ namespace ksmidi {
                 bool ignoreSense{ true };
                 size_t sysexChunkSize{ 1024 };
             };
+            Config config;
 
-            void process(const BYTE* data, DWORD size, LockFreeSPSCQueue<MidiMessage, 256>& queue, const std::string& sourceName, double timestamp, HANDLE eventToSignal) {
+            void process(const BYTE* data, DWORD size, LockFreeSPSCQueue<MidiMessage>& queue, const std::string& sourceName, double timestamp, HANDLE eventToSignal) {
                 bool messagePushed = false;
-                // Cache config values locally to avoid repeated dereferencing in the loop.
-                const bool ignoreSysex = config.ignoreSysex;
-                const bool ignoreTime = config.ignoreTime;
-                const bool ignoreSense = config.ignoreSense;
-
                 for (DWORD i = 0; i < size; ++i) {
-                    if (parseByte(data[i], queue, sourceName, timestamp, ignoreSysex, ignoreTime, ignoreSense)) {
+                    if (parseByte(data[i], queue, sourceName, timestamp)) {
                         messagePushed = true;
                     }
                 }
@@ -72,14 +89,11 @@ namespace ksmidi {
                     SetEvent(eventToSignal);
                 }
             }
-
-            Config config;
-
         private:
-            bool parseByte(BYTE byte, LockFreeSPSCQueue<MidiMessage, 256>& queue, const std::string& sourceName, double timestamp, bool ignoreSysex, bool ignoreTime, bool ignoreSense) {
+            bool parseByte(BYTE byte, LockFreeSPSCQueue<MidiMessage>& queue, const std::string& sourceName, double timestamp) {
                 if (state_ == State::SysEx) {
-                    if (byte == 0xF7) { // End of SysEx
-                        if (!ignoreSysex) {
+                    if (byte == 0xF7) {
+                        if (!config.ignoreSysex) {
                             sysex_buffer_.push_back(byte);
                             MidiMessage msg{ timestamp, std::move(sysex_buffer_), sourceName, false };
                             queue.try_push(std::move(msg));
@@ -87,16 +101,16 @@ namespace ksmidi {
                         }
                         state_ = State::Idle;
                         runningStatus_ = 0;
-                        return !ignoreSysex;
+                        return !config.ignoreSysex;
                     }
                     else {
                         sysex_buffer_.push_back(byte);
                         size_t chunkSize = config.sysexChunkSize;
                         if (chunkSize > 0 && sysex_buffer_.size() >= chunkSize) {
-                            if (!ignoreSysex) {
-                                // For chunks, we must copy, as the message continues.
+                            if (!config.ignoreSysex) {
                                 queue.try_push({ timestamp, sysex_buffer_, sourceName, true });
-                                sysex_buffer_.clear(); // Continue with a new chunk
+                                sysex_buffer_.clear();
+                                sysex_buffer_.reserve(chunkSize);
                                 return true;
                             }
                             sysex_buffer_.clear();
@@ -105,33 +119,34 @@ namespace ksmidi {
                     return false;
                 }
 
-                if (byte >= 0xF8) { // Real-time messages
-                    if ((!ignoreTime && byte <= 0xFB) || (!ignoreSense && byte >= 0xFE)) {
+                if (byte >= 0xF8) {
+                    if ((!config.ignoreTime && byte <= 0xFB) || (!config.ignoreSense && byte >= 0xFE)) {
                         MidiMessage msg{ timestamp, {byte}, sourceName };
                         return queue.try_push(std::move(msg));
                     }
                     return false;
                 }
 
-                if (byte >= 0x80) { // Status byte
+                if (byte >= 0x80) {
                     message_len_ = 0;
                     message_buffer_[message_len_++] = byte;
-                    bytesNeeded_ = bytesForStatus(byte);
+                    bytesNeeded_ = kBytesNeeded[byte];
                     state_ = (bytesNeeded_ > 0) ? State::ExpectData : State::Idle;
                     if (byte == 0xF0) {
                         state_ = State::SysEx;
                         sysex_buffer_.clear();
+                        if (config.sysexChunkSize > 0) sysex_buffer_.reserve(config.sysexChunkSize);
                         sysex_buffer_.push_back(byte);
                         return false;
                     }
-                    return (bytesNeeded_ == 0) ? handleCompleteMessage(queue, sourceName, timestamp, ignoreTime, ignoreSense) : false;
+                    return (bytesNeeded_ == 0) ? handleCompleteMessage(queue, sourceName, timestamp) : false;
                 }
-                else { // Data byte
-                    if (state_ == State::Idle) { // Assuming running status
-                        if (runningStatus_ == 0) return false; // Ignore stray data byte
+                else {
+                    if (state_ == State::Idle) {
+                        if (runningStatus_ == 0) return false;
                         message_len_ = 0;
                         message_buffer_[message_len_++] = runningStatus_;
-                        bytesNeeded_ = bytesForStatus(runningStatus_);
+                        bytesNeeded_ = kBytesNeeded[runningStatus_];
                         state_ = State::ExpectData;
                     }
 
@@ -144,22 +159,22 @@ namespace ksmidi {
                             runningStatus_ = message_buffer_[0];
                         }
                         state_ = State::Idle;
-                        return handleCompleteMessage(queue, sourceName, timestamp, ignoreTime, ignoreSense);
+                        return handleCompleteMessage(queue, sourceName, timestamp);
                     }
                 }
                 return false;
             }
 
-            bool handleCompleteMessage(LockFreeSPSCQueue<MidiMessage, 256>& queue, const std::string& sourceName, double timestamp, bool ignoreTime, bool ignoreSense) {
+            bool handleCompleteMessage(LockFreeSPSCQueue<MidiMessage>& queue, const std::string& sourceName, double timestamp) {
                 BYTE status = message_buffer_[0];
                 bool shouldPush = false;
-                if (status >= 0xF0) { // System Common messages
-                    if ((!ignoreTime && (status == 0xF1 || status == 0xF3)) ||
-                        (!ignoreSense && status == 0xF6)) {
+                if (status >= 0xF0) {
+                    if ((!config.ignoreTime && (status == 0xF1 || status == 0xF3)) ||
+                        (!config.ignoreSense && status == 0xF6)) {
                         shouldPush = true;
                     }
                 }
-                else { // Channel messages
+                else {
                     shouldPush = true;
                 }
 
@@ -173,23 +188,91 @@ namespace ksmidi {
                 return false;
             }
 
-            static int bytesForStatus(BYTE status) {
-                BYTE highNibble = status & 0xF0;
-                if (highNibble == 0xC0 || highNibble == 0xD0 || status == 0xF1 || status == 0xF3) return 1;
-                if ((highNibble >= 0x80 && highNibble <= 0xE0) || status == 0xF2) return 2;
-                return 0; // Single-byte messages (0xF6) or SysEx start (0xF0)
-            }
-
             enum class State { Idle, ExpectData, SysEx };
             State state_{ State::Idle };
-
-            // OPTIMIZATION: Use a fixed-size buffer for common, short MIDI messages.
             BYTE message_buffer_[32]{};
             size_t message_len_ = 0;
             std::vector<BYTE> sysex_buffer_;
-
             BYTE runningStatus_ = 0;
             int bytesNeeded_ = 0;
+        };
+
+        // --- MIDI 2.0 UMP Parser ---
+        class UmpParser {
+        public:
+            void process(const BYTE* data, DWORD size, LockFreeSPSCQueue<ump::UmpMessage>& queue, const std::string& sourceName, double timestamp, HANDLE eventToSignal) {
+                bool messagePushed = false;
+                for (DWORD i = 0; i < size; ++i) {
+                    if (parseByte(data[i], queue, sourceName, timestamp)) {
+                        messagePushed = true;
+                    }
+                }
+                if (messagePushed && eventToSignal) {
+                    SetEvent(eventToSignal);
+                }
+            }
+
+        private:
+            static uint8_t getUmpPacketSizeInWords(uint8_t messageType) {
+                switch (messageType) {
+                case 0x0: case 0x1: case 0x2: return 1;
+                case 0x3: case 0x4: return 2;
+                case 0x5: return 4;
+                case 0x6: case 0x7: return 1; // Reserved 32-bit
+                case 0x8: case 0x9: case 0xA: return 2; // Reserved 64-bit
+                case 0xB: case 0xC: return 3; // Reserved 96-bit
+                case 0xD: case 0xE: case 0xF: return 4; // Reserved 128-bit
+                default: return 0; // Should not happen
+                }
+            }
+
+            bool parseByte(BYTE byte, LockFreeSPSCQueue<ump::UmpMessage>& queue, const std::string& sourceName, double timestamp) {
+                packetBuffer_[bytesReceived_++] = byte;
+
+                if (state_ == State::AwaitingPacket) {
+                    if (bytesReceived_ == 4) { // Received the first word
+                        uint8_t mt = (packetBuffer_[0] >> 4) & 0x0F;
+                        wordsExpected_ = getUmpPacketSizeInWords(mt);
+
+                        if (wordsExpected_ == 1) {
+                            return pushCompletePacket(queue, sourceName, timestamp);
+                        }
+                        else if (wordsExpected_ > 1 && wordsExpected_ <= 4) {
+                            state_ = State::AwaitingData;
+                        }
+                        else { // Invalid message type
+                            bytesReceived_ = 0;
+                            wordsExpected_ = 0;
+                        }
+                    }
+                }
+                else { // AwaitingData
+                    if (bytesReceived_ == (wordsExpected_ * 4)) {
+                        return pushCompletePacket(queue, sourceName, timestamp);
+                    }
+                }
+                return false;
+            }
+
+            bool pushCompletePacket(LockFreeSPSCQueue<ump::UmpMessage>& queue, const std::string& sourceName, double timestamp) {
+                ump::UmpMessage msg;
+                msg.timestamp = timestamp;
+                msg.source = sourceName;
+                msg.size_in_words = wordsExpected_;
+                std::memcpy(msg.words.data(), packetBuffer_.data(), wordsExpected_ * 4);
+
+                state_ = State::AwaitingPacket;
+                bytesReceived_ = 0;
+                wordsExpected_ = 0;
+
+                return queue.try_push(std::move(msg));
+            }
+
+            enum class State { AwaitingPacket, AwaitingData };
+            State state_ = State::AwaitingPacket;
+            std::array<BYTE, 16> packetBuffer_{};
+            uint8_t bytesReceived_ = 0;
+            uint8_t wordsExpected_ = 0;
         };
 
         class DeviceEnumerator {
@@ -221,8 +304,16 @@ namespace ksmidi {
                     if (!DeviceIoControl(filter.get(), IOCTL_KS_PROPERTY, &pinProp, sizeof(pinProp), &pinCount, sizeof(pinCount), &bytesReturned, nullptr)) continue;
 
                     for (DWORD pinId = 0; pinId < pinCount; ++pinId) {
-                        if (isPinMidi(filter.get(), pinId, flow)) {
-                            devices.push_back({ (unsigned int)devices.size(), getFriendlyName(devInfo.get(), &ifd), detail->DevicePath, pinId, getAvailableInstances(filter.get(), pinId) > 0 });
+                        auto support = getPinMidiSupport(filter.get(), pinId, flow);
+                        if (support.first) { // Is it a MIDI pin?
+                            devices.push_back({
+                                (unsigned int)devices.size(),
+                                getFriendlyName(devInfo.get(), &ifd),
+                                detail->DevicePath,
+                                pinId,
+                                getAvailableInstances(filter.get(), pinId) > 0,
+                                support.second // Does it support MIDI 2.0?
+                                });
                         }
                     }
                 }
@@ -230,31 +321,39 @@ namespace ksmidi {
             }
 
         private:
-            static bool isPinMidi(HANDLE filter, DWORD pinId, KSPIN_DATAFLOW desiredFlow) {
+            static std::pair<bool, bool> getPinMidiSupport(HANDLE filter, DWORD pinId, KSPIN_DATAFLOW desiredFlow) {
                 KSP_PIN pinFlowProp{ {KSPROPSETID_Pin, KSPROPERTY_PIN_DATAFLOW, KSPROPERTY_TYPE_GET}, pinId, 0 };
                 KSPIN_DATAFLOW flow;
                 DWORD bytesReturned = 0;
                 if (!DeviceIoControl(filter, IOCTL_KS_PROPERTY, &pinFlowProp, sizeof(pinFlowProp), &flow, sizeof(flow), &bytesReturned, nullptr) || flow != desiredFlow) {
-                    return false;
+                    return { false, false };
                 }
 
                 KSP_PIN pinRangeProp{ {KSPROPSETID_Pin, KSPROPERTY_PIN_DATARANGES, KSPROPERTY_TYPE_GET}, pinId, 0 };
                 ULONG size = 0;
                 DeviceIoControl(filter, IOCTL_KS_PROPERTY, &pinRangeProp, sizeof(pinRangeProp), nullptr, 0, &size, nullptr);
-                if (size == 0) return false;
+                if (size == 0) return { false, false };
 
                 std::vector<BYTE> buffer(size);
-                if (!DeviceIoControl(filter, IOCTL_KS_PROPERTY, &pinRangeProp, sizeof(pinRangeProp), buffer.data(), size, &bytesReturned, nullptr)) return false;
+                if (!DeviceIoControl(filter, IOCTL_KS_PROPERTY, &pinRangeProp, sizeof(pinRangeProp), buffer.data(), size, &bytesReturned, nullptr)) return { false, false };
+
+                bool supportsMidi1 = false;
+                bool supportsMidi2 = false;
 
                 auto* multipleItem = reinterpret_cast<PKSMULTIPLE_ITEM>(buffer.data());
                 auto* dataRange = reinterpret_cast<PKSDATARANGE>(multipleItem + 1);
                 for (ULONG i = 0; i < multipleItem->Count; ++i) {
-                    if (IsEqualGUID(dataRange->MajorFormat, KSDATAFORMAT_TYPE_MUSIC) && IsEqualGUID(dataRange->SubFormat, KSDATAFORMAT_SUBTYPE_MIDI)) {
-                        return true;
+                    if (IsEqualGUID(dataRange->MajorFormat, KSDATAFORMAT_TYPE_MUSIC)) {
+                        if (IsEqualGUID(dataRange->SubFormat, KSDATAFORMAT_SUBTYPE_MIDI)) {
+                            supportsMidi1 = true;
+                        }
+                        else if (IsEqualGUID(dataRange->SubFormat, KSDATAFORMAT_SUBTYPE_UNIVERSALMIDIPACKET)) {
+                            supportsMidi2 = true;
+                        }
                     }
                     dataRange = reinterpret_cast<PKSDATARANGE>(reinterpret_cast<PBYTE>(dataRange) + KS_ALIGN_UP(dataRange->FormatSize, 8));
                 }
-                return false;
+                return { supportsMidi1 || supportsMidi2, supportsMidi2 };
             }
 
             static long getAvailableInstances(HANDLE filter, DWORD pinId) {
@@ -281,11 +380,11 @@ namespace ksmidi {
                 return name;
             }
         };
-    } // namespace internal
+    }
 
 
 
-    KsMidiError::KsMidiError(const std::string& what, HRESULT code) : std::runtime_error(what + internal::FormatWinError(code)), code_(code) {}
+    KsMidiError::KsMidiError(std::string_view what, HRESULT code) : std::runtime_error(std::string(what) + internal::FormatWinError(code)), code_(code) {}
     HRESULT KsMidiError::code() const noexcept { return code_; }
 
     unsigned int Api::getPortCountIn() { return static_cast<unsigned int>(internal::DeviceEnumerator::enumerate(KSCATEGORY_CAPTURE, KSPIN_DATAFLOW_OUT).size()); }
@@ -303,8 +402,6 @@ namespace ksmidi {
         return devices[portNumber];
     }
 
-    // --- MidiOut Implementation ---
-
     class MidiOut::MidiOutImpl {
         friend class MidiOut;
     public:
@@ -313,10 +410,10 @@ namespace ksmidi {
         void openPort(unsigned int portNumber) {
             std::lock_guard<std::mutex> lock(mutex_);
             closePortImpl();
-            DeviceInfo info = Api::getPortInfoOut(portNumber);
-            if (!info.isAvailable) throw KsMidiError("Output port '" + info.name + "' is not available.", E_ACCESSDENIED);
+            info_ = Api::getPortInfoOut(portNumber);
+            if (!info_.isAvailable) throw KsMidiError("Output port '" + info_.name + "' is not available.", E_ACCESSDENIED);
 
-            filter_.reset(CreateFileW(info.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
+            filter_.reset(CreateFileW(info_.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
             if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
 
             const size_t connectSize = sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT);
@@ -326,10 +423,16 @@ namespace ksmidi {
 
             connect->Interface = { KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_STREAMING, 0 };
             connect->Medium = { KSMEDIUMSETID_Standard, 0, 0 };
-            connect->PinId = info.pinId;
+            connect->PinId = info_.pinId;
             connect->PinToHandle = nullptr;
             connect->Priority = { KSPRIORITY_NORMAL, 1 };
-            *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+
+            if (info_.supportsMidi2) {
+                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_UNIVERSALMIDIPACKET, KSDATAFORMAT_SPECIFIER_NONE };
+            }
+            else {
+                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+            }
 
             HANDLE rawPinHandle = nullptr;
             HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_WRITE, &rawPinHandle);
@@ -345,6 +448,8 @@ namespace ksmidi {
             std::lock_guard<std::mutex> lock(mutex_);
             closePortImpl();
         }
+
+        bool isUmpStream() const noexcept { return info_.supportsMidi2; }
 
         void sendMessageImpl(const BYTE* message, size_t size) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -371,12 +476,13 @@ namespace ksmidi {
         }
 
     private:
-        void closePortImpl() { // Assumes lock is held
+        void closePortImpl() {
             if (!pin_) return;
             try { setPinState(KSSTATE_STOP); }
             catch (const KsMidiError&) {}
             pin_.reset();
             filter_.reset();
+            info_ = {};
         }
 
         void setPinState(KSSTATE state) {
@@ -387,7 +493,8 @@ namespace ksmidi {
             }
         }
 
-        mutable std::mutex mutex_; // OPTIMIZATION: Use faster standard mutex
+        mutable std::mutex mutex_;
+        DeviceInfo info_;
         internal::UniqueHandle filter_, pin_;
         std::vector<BYTE> writeBuffer_;
     };
@@ -399,13 +506,37 @@ namespace ksmidi {
     void MidiOut::openPort(unsigned int portNumber) { pimpl_->openPort(portNumber); }
     void MidiOut::closePort() { pimpl_->closePort(); }
     bool MidiOut::isPortOpen() const noexcept { std::lock_guard<std::mutex> lock(pimpl_->mutex_); return pimpl_ && pimpl_->pin_; }
+    bool MidiOut::isUmpStream() const noexcept { return pimpl_ ? pimpl_->isUmpStream() : false; }
     void MidiOut::sendMessage(const std::vector<BYTE>& message) { pimpl_->sendMessageImpl(message.data(), message.size()); }
     void MidiOut::sendMessage(const BYTE* message, size_t size) { pimpl_->sendMessageImpl(message, size); }
+    void MidiOut::sendMessage(const ump::UmpMessage& message) { pimpl_->sendMessageImpl(reinterpret_cast<const BYTE*>(message.words.data()), message.size_in_words * 4); }
 
 
+    class MidiIn::MidiInImplBase {
+    public:
+        virtual ~MidiInImplBase() = default;
+        virtual void openPort(unsigned int portNumber, const MidiIn::Settings& settings) = 0;
+        virtual void closePort() = 0;
+        virtual bool isPortOpen() const noexcept = 0;
+        virtual bool isUmpStream() const noexcept = 0;
+        virtual bool try_pop_message(MidiMessage& message) noexcept = 0;
+        virtual std::optional<MidiMessage> pop_message() noexcept = 0;
+        virtual void setCallback(MessageCallback callback) = 0;
+        virtual void cancelCallback() = 0;
+        virtual bool try_pop_ump_message(ump::UmpMessage& message) noexcept = 0;
+        virtual std::optional<ump::UmpMessage> pop_ump_message() noexcept = 0;
+        virtual void setUmpCallback(UmpCallback callback) = 0;
+        virtual void cancelUmpCallback() = 0;
+        virtual bool try_pop_error(KsMidiError& error) noexcept = 0;
+        virtual std::optional<KsMidiError> pop_error() noexcept = 0;
+        virtual void setDirectCallback(DirectMessageCallback callback, void* userData) = 0;
+        virtual void cancelDirectCallback() = 0;
+        virtual void setErrorCallback(ErrorCallback callback) = 0;
+        virtual void ignoreTypes(bool s, bool t, bool n) = 0;
+    };
 
-    class MidiIn::MidiInImpl {
-        friend class MidiIn;
+    template<MidiIn::TimestampMode TMode>
+    class MidiInImpl final : public MidiIn::MidiInImplBase {
         struct ReadRequest {
             internal::UniqueHandle event;
             std::vector<BYTE> data;
@@ -419,21 +550,33 @@ namespace ksmidi {
                 header.FrameExtent = bufferSize;
             }
         };
-    public:
-        MidiInImpl() = default;
-        ~MidiInImpl() noexcept { closePort(); }
 
-        void openPort(unsigned int portNumber, const MidiIn::Settings& settings) {
-            std::lock_guard<std::mutex> lock(mutex_);
+    public:
+        explicit MidiInImpl(const MidiIn::Settings& settings) :
+            settings_(settings),
+            messageQueue_(settings.messageQueueSize),
+            umpMessageQueue_(settings.umpMessageQueueSize),
+            errorQueue_(settings.errorQueueSize)
+        {
             if (settings.bufferCount < 2) throw KsMidiError("Buffer count must be at least 2.", E_INVALIDARG);
+            if (TMode == MidiIn::TimestampMode::QPC || TMode == MidiIn::TimestampMode::Driver) {
+                QueryPerformanceFrequency(&perf_freq_);
+            }
+        }
+        ~MidiInImpl() noexcept override { closePort(); }
+
+        void openPort(unsigned int portNumber, const MidiIn::Settings& settings) override {
+            std::lock_guard<std::mutex> lock(mutex_);
             closePortImpl();
 
             settings_ = settings;
             info_ = Api::getPortInfoIn(portNumber);
+            isUmpStream_ = info_.supportsMidi2;
+
             if (!info_.isAvailable) throw KsMidiError("Input port '" + info_.name + "' is not available.", E_ACCESSDENIED);
 
             callback_signal_event_.reset(CreateEvent(nullptr, FALSE, FALSE, nullptr));
-            if (!callback_signal_event_) throw KsMidiError("Failed to create callback event.", static_cast<HRESULT>(GetLastError()));
+            ump_callback_signal_event_.reset(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
             filter_.reset(CreateFileW(info_.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
             if (!filter_ || filter_.get() == INVALID_HANDLE_VALUE) throw KsMidiError("Failed to open device filter", static_cast<HRESULT>(GetLastError()));
@@ -448,7 +591,13 @@ namespace ksmidi {
             connect->PinId = info_.pinId;
             connect->PinToHandle = nullptr;
             connect->Priority = { KSPRIORITY_NORMAL, 1 };
-            *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+
+            if (isUmpStream_) {
+                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_UNIVERSALMIDIPACKET, KSDATAFORMAT_SPECIFIER_NONE };
+            }
+            else {
+                *dataFormat = { sizeof(KSDATAFORMAT), 0, 0, 0, KSDATAFORMAT_TYPE_MUSIC, KSDATAFORMAT_SUBTYPE_MIDI, KSDATAFORMAT_SPECIFIER_NONE };
+            }
 
             HANDLE rawPinHandle = nullptr;
             HRESULT hr = KsCreatePin(filter_.get(), connect, GENERIC_READ, &rawPinHandle);
@@ -461,73 +610,91 @@ namespace ksmidi {
             parser_.config.ignoreTime = settings_.ignoreTime;
             parser_.config.ignoreSense = settings_.ignoreSense;
             parser_.config.sysexChunkSize = settings_.sysexChunkSize;
-            QueryPerformanceFrequency(&perf_freq_);
             stop_flag_ = false;
             reader_thread_ = std::thread(&MidiInImpl::readerLoop, this);
         }
 
-        void closePort() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            closePortImpl();
-        }
+        void closePort() override { std::lock_guard<std::mutex> lock(mutex_); closePortImpl(); }
+        bool isPortOpen() const noexcept override { return !stop_flag_.load(std::memory_order_relaxed); }
+        bool isUmpStream() const noexcept override { return isUmpStream_; }
 
+        // MIDI 1.0 API
+        bool try_pop_message(MidiMessage& message) noexcept override { return messageQueue_.try_pop(message); }
+        std::optional<MidiMessage> pop_message() noexcept override { return messageQueue_.pop(); }
+        void setCallback(MidiIn::MessageCallback callback) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cancelDirectCallbackImpl(); cancelUmpCallbackImpl(); cancelCallbackImpl();
+            message_callback_ = std::move(callback);
+            if (message_callback_) { stop_polling_ = false; poller_thread_ = std::thread(&MidiInImpl::pollingLoop, this); }
+        }
+        void cancelCallback() override { std::lock_guard<std::mutex> lock(mutex_); cancelCallbackImpl(); }
+
+        // MIDI 2.0 API
+        bool try_pop_ump_message(ump::UmpMessage& message) noexcept override { return umpMessageQueue_.try_pop(message); }
+        std::optional<ump::UmpMessage> pop_ump_message() noexcept override { return umpMessageQueue_.pop(); }
+        void setUmpCallback(MidiIn::UmpCallback callback) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cancelDirectCallbackImpl(); cancelCallbackImpl(); cancelUmpCallbackImpl();
+            ump_callback_ = std::move(callback);
+            if (ump_callback_) { stop_ump_polling_ = false; ump_poller_thread_ = std::thread(&MidiInImpl::umpPollingLoop, this); }
+        }
+        void cancelUmpCallback() override { std::lock_guard<std::mutex> lock(mutex_); cancelUmpCallbackImpl(); }
+
+        // Common API
+        bool try_pop_error(KsMidiError& error) noexcept override { return errorQueue_.try_pop(error); }
+        std::optional<KsMidiError> pop_error() noexcept override { return errorQueue_.pop(); }
+        void setDirectCallback(MidiIn::DirectMessageCallback callback, void* userData) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cancelCallbackImpl(); cancelUmpCallbackImpl();
+            direct_callback_user_data_ = userData;
+            direct_callback_.store(callback, std::memory_order_release);
+        }
+        void cancelDirectCallback() override { std::lock_guard<std::mutex> lock(mutex_); cancelDirectCallbackImpl(); }
+        void setErrorCallback(MidiIn::ErrorCallback callback) override { std::lock_guard<std::mutex> lock(mutex_); error_callback_ = std::move(callback); }
+        void ignoreTypes(bool s, bool t, bool n) override { parser_.config.ignoreSysex = s; parser_.config.ignoreTime = t; parser_.config.ignoreSense = n; }
+
+    private:
         void closePortImpl() {
             if (stop_flag_.load(std::memory_order_relaxed) || !reader_thread_.joinable()) return;
-
             stop_flag_ = true;
-            cancelCallbackImpl();
-
+            cancelCallbackImpl(); cancelUmpCallbackImpl(); cancelDirectCallbackImpl();
             if (pin_) CancelIoEx(pin_.get(), nullptr);
             if (reader_thread_.joinable()) reader_thread_.join();
-
             if (pin_) { try { setPinState(KSSTATE_STOP); } catch (const KsMidiError&) {} }
-            pin_.reset();
-            filter_.reset();
+            pin_.reset(); filter_.reset(); info_ = {}; isUmpStream_ = false;
         }
 
-        void setCallback(MessageCallback callback) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cancelCallbackImpl();
-            message_callback_ = std::move(callback);
-            if (message_callback_) {
-                stop_polling_ = false;
-                poller_thread_ = std::thread(&MidiInImpl::pollingLoop, this);
-            }
-        }
-
-        void cancelCallback() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cancelCallbackImpl();
-        }
-
-        void cancelCallbackImpl() { 
+        void cancelCallbackImpl() {
             if (!poller_thread_.joinable()) return;
             stop_polling_ = true;
             if (callback_signal_event_) SetEvent(callback_signal_event_.get());
             poller_thread_.join();
             message_callback_ = nullptr;
         }
-
-        void ignoreTypes(bool sysex, bool time, bool sense) {
-            parser_.config.ignoreSysex = sysex;
-            parser_.config.ignoreTime = time;
-            parser_.config.ignoreSense = sense;
+        void cancelUmpCallbackImpl() {
+            if (!ump_poller_thread_.joinable()) return;
+            stop_ump_polling_ = true;
+            if (ump_callback_signal_event_) SetEvent(ump_callback_signal_event_.get());
+            ump_poller_thread_.join();
+            ump_callback_ = nullptr;
         }
+        void cancelDirectCallbackImpl() { direct_callback_.store(nullptr, std::memory_order_release); direct_callback_user_data_ = nullptr; }
 
-    private:
         void pollingLoop() {
-            MidiMessage msg;
-            KsMidiError err;
             while (!stop_polling_) {
                 WaitForSingleObject(callback_signal_event_.get(), INFINITE);
                 if (stop_polling_) break;
+                while (auto msg = messageQueue_.pop()) { if (message_callback_) message_callback_(*msg); }
+                while (auto err = errorQueue_.pop()) { if (error_callback_) error_callback_(*err); }
+            }
+        }
 
-                while (messageQueue_.try_pop(msg)) {
-                    if (message_callback_) message_callback_(msg);
-                }
-                while (errorQueue_.try_pop(err)) {
-                    if (error_callback_) error_callback_(err);
-                }
+        void umpPollingLoop() {
+            while (!stop_ump_polling_) {
+                WaitForSingleObject(ump_callback_signal_event_.get(), INFINITE);
+                if (stop_ump_polling_) break;
+                while (auto msg = umpMessageQueue_.pop()) { if (ump_callback_) ump_callback_(*msg); }
+                while (auto err = errorQueue_.pop()) { if (error_callback_) error_callback_(*err); }
             }
         }
 
@@ -585,26 +752,53 @@ namespace ksmidi {
             return true;
         }
 
-        void processData(const KSSTREAM_HEADER& header) {
-            const BYTE* current = static_cast<const BYTE*>(header.Data);
-            DWORD bytesToProcess = header.DataUsed;
+        void processData(const KSSTREAM_HEADER& header) noexcept {
+            double ts = 0.0;
+            if constexpr (TMode == MidiIn::TimestampMode::QPC) {
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                ts = static_cast<double>(now.QuadPart) / perf_freq_.QuadPart;
+            }
+            else if constexpr (TMode == MidiIn::TimestampMode::Driver) {
+                ts = static_cast<double>(header.PresentationTime.Time) / 10'000'000.0;
+            }
 
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double timestamp = static_cast<double>(now.QuadPart) / perf_freq_.QuadPart;
+            const BYTE* p = static_cast<const BYTE*>(header.Data);
+            const BYTE* const end = p + header.DataUsed;
+            auto* const cb = direct_callback_.load(std::memory_order_acquire);
 
-            while (bytesToProcess >= sizeof(KSMUSICFORMAT)) {
-                auto* musicHeader = reinterpret_cast<const KSMUSICFORMAT*>(current);
-                if (musicHeader->ByteCount > 0 && bytesToProcess >= sizeof(KSMUSICFORMAT) + musicHeader->ByteCount) {
-                    parser_.process(current + sizeof(KSMUSICFORMAT), musicHeader->ByteCount, messageQueue_, info_.name, timestamp, callback_signal_event_.get());
+            if (cb) {
+                // High-performance direct callback path
+                void* const cbUser = direct_callback_user_data_;
+                const BYTE* const lim = end - sizeof(KSMUSICFORMAT);
+                while (p <= lim) {
+                    const auto* fmt = reinterpret_cast<const KSMUSICFORMAT*>(p);
+                    const DWORD bc = fmt->ByteCount;
+                    const BYTE* payload = p + sizeof(KSMUSICFORMAT);
+                    if (bc == 0 || payload + bc > end) break;
+                    cb(payload, bc, ts, cbUser);
+                    p += KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + bc, 8);
                 }
-                DWORD alignedSize = KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + musicHeader->ByteCount, 8);
-                if (alignedSize == 0 || alignedSize > bytesToProcess) break;
-                current += alignedSize;
-                bytesToProcess -= alignedSize;
+            }
+            else {
+                // Standard, parsing callback path
+                const BYTE* const lim = end - sizeof(KSMUSICFORMAT);
+                while (p <= lim) {
+                    const auto* fmt = reinterpret_cast<const KSMUSICFORMAT*>(p);
+                    const DWORD bc = fmt->ByteCount;
+                    const BYTE* payload = p + sizeof(KSMUSICFORMAT);
+                    if (bc == 0 || payload + bc > end) break;
+
+                    if (isUmpStream_) {
+                        ump_parser_.process(payload, bc, umpMessageQueue_, info_.name, ts, ump_callback_signal_event_.get());
+                    }
+                    else {
+                        parser_.process(payload, bc, messageQueue_, info_.name, ts, callback_signal_event_.get());
+                    }
+
+                    p += KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + bc, 8);
+                }
             }
         }
-
         void setPinState(KSSTATE state) {
             KSPROPERTY prop{ KSPROPSETID_Connection, KSPROPERTY_CONNECTION_STATE, KSPROPERTY_TYPE_SET };
             DWORD bytesReturned = 0;
@@ -612,36 +806,71 @@ namespace ksmidi {
                 if (state != KSSTATE_STOP) throw KsMidiError("Failed to set pin state", static_cast<HRESULT>(GetLastError()));
             }
         }
+        mutable std::mutex mutex_;
+        LockFreeSPSCQueue<MidiMessage> messageQueue_;
+        LockFreeSPSCQueue<ump::UmpMessage> umpMessageQueue_;
+        LockFreeSPSCQueue<KsMidiError> errorQueue_;
 
-        mutable std::mutex mutex_; 
-        LockFreeSPSCQueue<MidiMessage, 256> messageQueue_;
-        LockFreeSPSCQueue<KsMidiError, 16> errorQueue_;
         MidiIn::MessageCallback message_callback_;
+        std::thread poller_thread_;
+        std::atomic<bool> stop_polling_{ true };
+
+        MidiIn::UmpCallback ump_callback_;
+        std::thread ump_poller_thread_;
+        std::atomic<bool> stop_ump_polling_{ true };
+
+        std::atomic<MidiIn::DirectMessageCallback> direct_callback_{ nullptr };
+        void* direct_callback_user_data_{ nullptr };
+
         MidiIn::ErrorCallback error_callback_;
         std::atomic<bool> stop_flag_{ true };
-        std::atomic<bool> stop_polling_{ true };
         internal::UniqueHandle filter_, pin_;
         internal::UniqueHandle callback_signal_event_;
+        internal::UniqueHandle ump_callback_signal_event_;
         DeviceInfo info_;
         MidiIn::Settings settings_;
         std::thread reader_thread_;
-        std::thread poller_thread_;
         internal::MidiParser parser_;
+        internal::UmpParser ump_parser_;
+        bool isUmpStream_ = false;
         LARGE_INTEGER perf_freq_{};
     };
 
-    MidiIn::MidiIn() : pimpl_(std::make_unique<MidiInImpl>()) {}
-    MidiIn::~MidiIn() noexcept { try { pimpl_->closePort(); } catch (...) {} }
+    MidiIn::MidiIn() = default;
+    MidiIn::~MidiIn() noexcept { if (pimpl_) try { pimpl_->closePort(); } catch (...) {} }
     MidiIn::MidiIn(MidiIn&&) noexcept = default;
     MidiIn& MidiIn::operator=(MidiIn&&) noexcept = default;
-    void MidiIn::openPort(unsigned int portNumber, const Settings& settings) { pimpl_->openPort(portNumber, settings); }
-    void MidiIn::closePort() { pimpl_->closePort(); }
-    bool MidiIn::isPortOpen() const noexcept { std::lock_guard<std::mutex> lock(pimpl_->mutex_); return pimpl_ && !pimpl_->stop_flag_.load(std::memory_order_relaxed); }
-    bool MidiIn::try_pop_message(MidiMessage& message) noexcept { return pimpl_->messageQueue_.try_pop(message); }
-    bool MidiIn::try_pop_error(KsMidiError& error) noexcept { return pimpl_->errorQueue_.try_pop(error); }
-    void MidiIn::setCallback(MessageCallback callback) { pimpl_->setCallback(std::move(callback)); }
-    void MidiIn::cancelCallback() { pimpl_->cancelCallback(); }
-    void MidiIn::setErrorCallback(ErrorCallback callback) { std::lock_guard<std::mutex> lock(pimpl_->mutex_); pimpl_->error_callback_ = std::move(callback); }
-    void MidiIn::ignoreTypes(bool s, bool t, bool n) { pimpl_->ignoreTypes(s, t, n); }
 
-} // KSMidi
+    void MidiIn::openPort(unsigned int portNumber, const Settings& settings) {
+        if (pimpl_) { pimpl_->closePort(); }
+        auto is_power_of_two = [](size_t n) { return n != 0 && (n & (n - 1)) == 0; };
+        if (!is_power_of_two(settings.messageQueueSize) || !is_power_of_two(settings.umpMessageQueueSize) || !is_power_of_two(settings.errorQueueSize)) {
+            throw KsMidiError("Queue sizes must be a power of two.", E_INVALIDARG);
+        }
+        switch (settings.timestampMode) {
+        case TimestampMode::None: pimpl_ = std::make_unique<MidiInImpl<TimestampMode::None>>(settings); break;
+        case TimestampMode::Driver: pimpl_ = std::make_unique<MidiInImpl<TimestampMode::Driver>>(settings); break;
+        default: pimpl_ = std::make_unique<MidiInImpl<TimestampMode::QPC>>(settings); break;
+        }
+        pimpl_->openPort(portNumber, settings);
+    }
+
+    void MidiIn::closePort() { if (pimpl_) pimpl_->closePort(); }
+    bool MidiIn::isPortOpen() const noexcept { return pimpl_ ? pimpl_->isPortOpen() : false; }
+    bool MidiIn::isUmpStream() const noexcept { return pimpl_ ? pimpl_->isUmpStream() : false; }
+    bool MidiIn::try_pop_message(MidiMessage& message) noexcept { return pimpl_ ? pimpl_->try_pop_message(message) : false; }
+    std::optional<MidiMessage> MidiIn::pop_message() noexcept { return pimpl_ ? pimpl_->pop_message() : std::nullopt; }
+    void MidiIn::setCallback(MessageCallback callback) { if (pimpl_) pimpl_->setCallback(std::move(callback)); }
+    void MidiIn::cancelCallback() { if (pimpl_) pimpl_->cancelCallback(); }
+    bool MidiIn::try_pop_ump_message(ump::UmpMessage& message) noexcept { return pimpl_ ? pimpl_->try_pop_ump_message(message) : false; }
+    std::optional<ump::UmpMessage> MidiIn::pop_ump_message() noexcept { return pimpl_ ? pimpl_->pop_ump_message() : std::nullopt; }
+    void MidiIn::setUmpCallback(UmpCallback callback) { if (pimpl_) pimpl_->setUmpCallback(std::move(callback)); }
+    void MidiIn::cancelUmpCallback() { if (pimpl_) pimpl_->cancelUmpCallback(); }
+    bool MidiIn::try_pop_error(KsMidiError& error) noexcept { return pimpl_ ? pimpl_->try_pop_error(error) : false; }
+    std::optional<KsMidiError> MidiIn::pop_error() noexcept { return pimpl_ ? pimpl_->pop_error() : std::nullopt; }
+    void MidiIn::setErrorCallback(ErrorCallback callback) { if (pimpl_) pimpl_->setErrorCallback(std::move(callback)); }
+    void MidiIn::setDirectCallback(DirectMessageCallback callback, void* userData) { if (pimpl_) pimpl_->setDirectCallback(callback, userData); }
+    void MidiIn::cancelDirectCallback() { if (pimpl_) pimpl_->cancelDirectCallback(); }
+    void MidiIn::ignoreTypes(bool s, bool t, bool n) { if (pimpl_) pimpl_->ignoreTypes(s, t, n); }
+
+} // namespace ksmidi
