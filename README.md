@@ -57,7 +57,7 @@ Other points:
 ## Docs and roadmap
 
 * Full API guide: [`DOCUMENTATION.md`](DOCUMENTATION.md)
-* Planned: vcpkg / Conan package, virtual loopback helper, public latency tests.
+* Planned: vcpkg / Conan package, virtual loopback helper, public latency tests, and MIDI 2.0 tests.
 
 ---
 
