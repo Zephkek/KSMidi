@@ -22,8 +22,7 @@ Maintained by **Mohamed Maatallah** · 2025.
 
 1. Create a console project.
 2. Add the three files above.
-3. Link `setupapi.lib; ksuser.lib` (Linker → Input).
-4. Build and run `main.cpp`.
+3. Build and run `main.cpp`.
 
 If you use CMake, just add the two library files to your target.
 
