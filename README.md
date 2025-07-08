@@ -6,7 +6,7 @@
 
 Maintained by **Mohamed Maatallah** · 2025.
 
-***Using KSMidi requires that the Windows MIDI Service is stopped. It provides direct, single-client access to a MIDI device and is incompatible with the standard Windows MIDI system. Other MIDI applications will not function while an application using KSMidi is running.***
+**Using KSMidi requires that the Windows MIDI Service is stopped. It provides direct, single-client access to a MIDI device and is incompatible with the standard Windows MIDI system. Other MIDI applications will not function while an application using KSMidi is running.**
 ---
 
 ## Repo contents
