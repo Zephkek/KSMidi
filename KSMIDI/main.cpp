@@ -531,7 +531,7 @@ void benchmarkLatency() {
     }
     pressEnterToContinue();
 }
-
+// todo: fix wall clock
 void benchmarkThroughput() {
     printHeader("Output Throughput Benchmark");
     std::cout << "This test sends MIDI messages as fast as possible for 5 seconds to\n"
