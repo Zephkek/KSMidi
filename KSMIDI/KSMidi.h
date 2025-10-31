@@ -129,47 +129,47 @@ namespace ksmidi {
         };
 
         // --- UMP Helper Functions ---
-        inline MessageType getMessageType(const UmpMessage& msg) {
+        [[nodiscard]] inline MessageType getMessageType(const UmpMessage& msg) noexcept {
             return static_cast<MessageType>((msg.words[0] >> 28) & 0x0F);
         }
-        inline uint8_t getGroup(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getGroup(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 24) & 0x0F;
         }
-        inline uint8_t getStatus(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getStatus(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 16) & 0xFF;
         }
-        inline uint8_t getMidi1Channel(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi1Channel(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 16) & 0x0F;
         }
-        inline uint8_t getMidi1Status(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi1Status(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 20) & 0x0F;
         }
-        inline uint8_t getMidi2Channel(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi2Channel(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 16) & 0x0F;
         }
-        inline uint8_t getMidi2Status(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi2Status(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 20) & 0x0F;
         }
-        inline uint8_t getNoteNumber(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getNoteNumber(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 8) & 0x7F;
         }
-        inline uint8_t getMidi1Velocity(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi1Velocity(const UmpMessage& msg) noexcept {
             return msg.words[0] & 0x7F;
         }
-        inline uint16_t getMidi2Velocity(const UmpMessage& msg) {
+        [[nodiscard]] inline uint16_t getMidi2Velocity(const UmpMessage& msg) noexcept {
             return (msg.words[1] >> 16) & 0xFFFF;
         }
-        inline uint8_t getMidi1Data1(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi1Data1(const UmpMessage& msg) noexcept {
             return (msg.words[0] >> 8) & 0x7F;
         }
-        inline uint8_t getMidi1Data2(const UmpMessage& msg) {
+        [[nodiscard]] inline uint8_t getMidi1Data2(const UmpMessage& msg) noexcept {
             return msg.words[0] & 0x7F;
         }
-        inline uint32_t getMidi2Data(const UmpMessage& msg) { return msg.words[1]; }
-        inline uint8_t getAttributeType(const UmpMessage& msg) {
+        [[nodiscard]] inline uint32_t getMidi2Data(const UmpMessage& msg) noexcept { return msg.words[1]; }
+        [[nodiscard]] inline uint8_t getAttributeType(const UmpMessage& msg) noexcept {
             return msg.words[0] & 0xFF;
         }
-        inline uint16_t getAttributeData(const UmpMessage& msg) {
+        [[nodiscard]] inline uint16_t getAttributeData(const UmpMessage& msg) noexcept {
             return msg.words[1] & 0xFFFF;
         }
 

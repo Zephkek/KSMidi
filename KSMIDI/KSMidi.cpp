@@ -133,8 +133,9 @@ namespace ksmidi {
                 const std::string& sourceName, double timestamp,
                 HANDLE eventToSignal) {
                 bool messagePushed = false;
-                for (DWORD i = 0; i < size; ++i) {
-                    if (parseByte(data[i], queue, sourceName, timestamp)) {
+                const BYTE* const end = data + size;
+                for (const BYTE* p = data; p < end; ++p) {
+                    if (parseByte(*p, queue, sourceName, timestamp)) {
                         messagePushed = true;
                     }
                 }
@@ -158,9 +159,8 @@ namespace ksmidi {
                 msg.isSysExChunk = true;
                 if (queue.try_push(std::move(msg))) {
                     if (eventToSignal) SetEvent(eventToSignal);
-                    sysex_buffer_.clear();
-                    sysex_buffer_.reserve(config.sysexChunkSize);
                 }
+                sysex_buffer_.clear();
             }
 
         private:
@@ -180,7 +180,6 @@ namespace ksmidi {
                                 pushed = true;
                             }
                             sysex_buffer_.clear();
-                            sysex_buffer_.reserve(config.sysexChunkSize);
                         }
                         state_ = State::Idle;
                         runningStatus_ = 0;
@@ -198,7 +197,6 @@ namespace ksmidi {
                                 chunkMsg.isSysExChunk = true;
                                 bool pushed = queue.try_push(std::move(chunkMsg));
                                 sysex_buffer_.clear();
-                                sysex_buffer_.reserve(chunkSize);
                                 return pushed;
                             }
                         }
@@ -230,10 +228,12 @@ namespace ksmidi {
                 if (byte >= 0x80) {
                     if (byte == 0xF0) {
                         state_ = State::SysEx;
-                        sysex_buffer_.clear();
                         runningStatus_ = 0;
                         if (!config.ignoreSysex) {
-                            sysex_buffer_.reserve(config.sysexChunkSize);
+                            sysex_buffer_.clear();
+                            if (sysex_buffer_.capacity() < config.sysexChunkSize) {
+                                sysex_buffer_.reserve(config.sysexChunkSize);
+                            }
                             sysex_buffer_.push_back(byte);
                         }
                         return false;
@@ -291,7 +291,7 @@ namespace ksmidi {
                     msg.bytes = std::move(message_buffer_);
                     msg.source = sourceName;
                     message_buffer_.clear();
-                    message_buffer_.reserve(4);  // Keep capacity for next message
+                    // Don't reserve here - capacity is maintained by the move
                     return queue.try_push(std::move(msg));
                 }
                 return false;
@@ -313,8 +313,9 @@ namespace ksmidi {
                 const std::string& sourceName, double timestamp,
                 HANDLE eventToSignal) {
                 bool messagePushed = false;
-                for (DWORD i = 0; i < size; ++i) {
-                    if (parseByte(data[i], queue, sourceName, timestamp)) {
+                const BYTE* const end = data + size;
+                for (const BYTE* p = data; p < end; ++p) {
+                    if (parseByte(*p, queue, sourceName, timestamp)) {
                         messagePushed = true;
                     }
                 }
@@ -510,20 +511,27 @@ namespace ksmidi {
 
             static std::string getFriendlyName(HDEVINFO devInfo,
                 SP_DEVICE_INTERFACE_DATA* ifd) {
-                char name[256] = "Unknown Device";
                 HKEY regKey = SetupDiOpenDeviceInterfaceRegKey(devInfo, ifd, 0, KEY_READ);
-                if (regKey != INVALID_HANDLE_VALUE) {
-                    WCHAR wName[256]{};
-                    DWORD size = sizeof(wName);
-                    if (RegQueryValueExW(regKey, L"FriendlyName", nullptr, nullptr,
-                        reinterpret_cast<LPBYTE>(wName),
-                        &size) == ERROR_SUCCESS) {
-                        WideCharToMultiByte(CP_UTF8, 0, wName, -1, name, sizeof(name), nullptr,
-                            nullptr);
-                    }
-                    RegCloseKey(regKey);
+                if (regKey == INVALID_HANDLE_VALUE) {
+                    return "Unknown Device";
                 }
-                return name;
+
+                WCHAR wName[256]{};
+                DWORD size = sizeof(wName);
+                bool success = (RegQueryValueExW(regKey, L"FriendlyName", nullptr, nullptr,
+                    reinterpret_cast<LPBYTE>(wName), &size) == ERROR_SUCCESS);
+                RegCloseKey(regKey);
+
+                if (success) {
+                    // Calculate required buffer size
+                    int nameLen = WideCharToMultiByte(CP_UTF8, 0, wName, -1, nullptr, 0, nullptr, nullptr);
+                    if (nameLen > 0) {
+                        std::string name(nameLen - 1, '\0');  // -1 to exclude null terminator
+                        WideCharToMultiByte(CP_UTF8, 0, wName, -1, &name[0], nameLen, nullptr, nullptr);
+                        return name;
+                    }
+                }
+                return "Unknown Device";
             }
         };
     }  // namespace internal
@@ -533,29 +541,53 @@ namespace ksmidi {
         code_(code) {
     }
     HRESULT KsMidiError::code() const noexcept { return code_; }
+    // Cache for device enumeration to avoid repeated expensive system calls
+    namespace {
+        struct DeviceCache {
+            std::vector<DeviceInfo> inDevices;
+            std::vector<DeviceInfo> outDevices;
+            std::chrono::steady_clock::time_point lastUpdate;
+            std::mutex mutex;
+            static constexpr std::chrono::milliseconds CACHE_DURATION{500};
+
+            void updateIfNeeded() {
+                auto now = std::chrono::steady_clock::now();
+                if (inDevices.empty() || outDevices.empty() || 
+                    (now - lastUpdate) > CACHE_DURATION) {
+                    inDevices = internal::DeviceEnumerator::enumerate(
+                        KSCATEGORY_CAPTURE, KSPIN_DATAFLOW_OUT);
+                    outDevices = internal::DeviceEnumerator::enumerate(
+                        KSCATEGORY_RENDER, KSPIN_DATAFLOW_IN);
+                    lastUpdate = now;
+                }
+            }
+        };
+        DeviceCache g_deviceCache;
+    }
+
     unsigned int Api::getPortCountIn() {
-        return static_cast<unsigned int>(internal::DeviceEnumerator::enumerate(
-            KSCATEGORY_CAPTURE, KSPIN_DATAFLOW_OUT)
-            .size());
+        std::lock_guard<std::mutex> lock(g_deviceCache.mutex);
+        g_deviceCache.updateIfNeeded();
+        return static_cast<unsigned int>(g_deviceCache.inDevices.size());
     }
     unsigned int Api::getPortCountOut() {
-        return static_cast<unsigned int>(internal::DeviceEnumerator::enumerate(
-            KSCATEGORY_RENDER, KSPIN_DATAFLOW_IN)
-            .size());
+        std::lock_guard<std::mutex> lock(g_deviceCache.mutex);
+        g_deviceCache.updateIfNeeded();
+        return static_cast<unsigned int>(g_deviceCache.outDevices.size());
     }
     DeviceInfo Api::getPortInfoIn(unsigned int portNumber) {
-        auto devices = internal::DeviceEnumerator::enumerate(KSCATEGORY_CAPTURE,
-            KSPIN_DATAFLOW_OUT);
-        if (portNumber >= devices.size())
+        std::lock_guard<std::mutex> lock(g_deviceCache.mutex);
+        g_deviceCache.updateIfNeeded();
+        if (portNumber >= g_deviceCache.inDevices.size())
             throw KsMidiError("Invalid input port number specified.", E_INVALIDARG);
-        return devices[portNumber];
+        return g_deviceCache.inDevices[portNumber];
     }
     DeviceInfo Api::getPortInfoOut(unsigned int portNumber) {
-        auto devices = internal::DeviceEnumerator::enumerate(KSCATEGORY_RENDER,
-            KSPIN_DATAFLOW_IN);
-        if (portNumber >= devices.size())
+        std::lock_guard<std::mutex> lock(g_deviceCache.mutex);
+        g_deviceCache.updateIfNeeded();
+        if (portNumber >= g_deviceCache.outDevices.size())
             throw KsMidiError("Invalid output port number specified.", E_INVALIDARG);
-        return devices[portNumber];
+        return g_deviceCache.outDevices[portNumber];
     }
 
     // --- MidiOut Implementation ---
@@ -630,9 +662,11 @@ namespace ksmidi {
 
             const DWORD payloadSize = sizeof(KSMUSICFORMAT) + static_cast<DWORD>(size);
 
-            if (writeBuffer_.size() < payloadSize) {
-                writeBuffer_.resize(payloadSize);
+            // Only resize if we need more space, avoid shrinking
+            if (writeBuffer_.capacity() < payloadSize) {
+                writeBuffer_.reserve(payloadSize);
             }
+            writeBuffer_.resize(payloadSize);
 
             auto* musicHeader = reinterpret_cast<PKSMUSICFORMAT>(writeBuffer_.data());
             musicHeader->TimeDeltaMs = 0;
@@ -1022,6 +1056,24 @@ namespace ksmidi {
             return true;
         }
 
+        // Helper to calculate timestamp for a message
+        inline double calculateTimestamp(const KSMUSICFORMAT* fmt, double buffer_qpc_ts) noexcept {
+            if constexpr (TMode == TimestampMode::QPC) {
+                return buffer_qpc_ts - timestamp_baseline_;
+            }
+            else if constexpr (TMode == TimestampMode::None) {
+                return 0.0;
+            }
+            else {  // Driver mode
+                driver_time_accumulator_ += fmt->TimeDeltaMs * 0.001;
+                if (!driver_stream_baseline_set_.load(std::memory_order_relaxed)) {
+                    driver_stream_baseline_ = driver_time_accumulator_;
+                    driver_stream_baseline_set_.store(true, std::memory_order_relaxed);
+                }
+                return driver_time_accumulator_ - driver_stream_baseline_;
+            }
+        }
+
         void processData(const KSSTREAM_HEADER& header) noexcept {
             double buffer_qpc_ts = 0.0;
             if constexpr (TMode == TimestampMode::QPC) {
@@ -1058,19 +1110,7 @@ namespace ksmidi {
                     const BYTE* const payload = p + sizeof(KSMUSICFORMAT);
                     if (byte_count == 0 || (payload > end || byte_count > static_cast<DWORD>(end - payload))) break;
 
-                    double final_msg_ts;
-                    if constexpr (TMode == TimestampMode::QPC) {
-                        final_msg_ts = buffer_qpc_ts - timestamp_baseline_;
-                    }
-                    else {
-                        driver_time_accumulator_ += fmt->TimeDeltaMs * 0.001;
-                        if (!driver_stream_baseline_set_.load(std::memory_order_relaxed)) {
-                            driver_stream_baseline_ = driver_time_accumulator_;
-                            driver_stream_baseline_set_.store(true, std::memory_order_relaxed);
-                        }
-                        final_msg_ts = driver_time_accumulator_ - driver_stream_baseline_;
-                    }
-
+                    const double final_msg_ts = calculateTimestamp(fmt, buffer_qpc_ts);
                     cb(payload, byte_count, final_msg_ts, user_data);
 
                     const ULONG aligned_size = KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + byte_count, 8);
@@ -1088,19 +1128,7 @@ namespace ksmidi {
                         const BYTE* const payload = p + sizeof(KSMUSICFORMAT);
                         if (byte_count == 0 || (payload > end || byte_count > static_cast<DWORD>(end - payload))) break;
 
-                        double final_msg_ts;
-                        if constexpr (TMode == TimestampMode::QPC) {
-                            final_msg_ts = buffer_qpc_ts - timestamp_baseline_;
-                        }
-                        else {
-                            driver_time_accumulator_ += fmt->TimeDeltaMs * 0.001;
-                            if (!driver_stream_baseline_set_.load(std::memory_order_relaxed)) {
-                                driver_stream_baseline_ = driver_time_accumulator_;
-                                driver_stream_baseline_set_.store(true, std::memory_order_relaxed);
-                            }
-                            final_msg_ts = driver_time_accumulator_ - driver_stream_baseline_;
-                        }
-
+                        const double final_msg_ts = calculateTimestamp(fmt, buffer_qpc_ts);
                         parser_.process(payload, byte_count, messageQueue_, info_.name, final_msg_ts, callback_signal_event_.get());
 
                         const ULONG aligned_size = KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + byte_count, 8);
@@ -1117,19 +1145,7 @@ namespace ksmidi {
                         const BYTE* const payload = p + sizeof(KSMUSICFORMAT);
                         if (byte_count == 0 || (payload > end || byte_count > static_cast<DWORD>(end - payload))) break;
 
-                        double final_msg_ts;
-                        if constexpr (TMode == TimestampMode::QPC) {
-                            final_msg_ts = buffer_qpc_ts - timestamp_baseline_;
-                        }
-                        else {
-                            driver_time_accumulator_ += fmt->TimeDeltaMs * 0.001;
-                            if (!driver_stream_baseline_set_.load(std::memory_order_relaxed)) {
-                                driver_stream_baseline_ = driver_time_accumulator_;
-                                driver_stream_baseline_set_.store(true, std::memory_order_relaxed);
-                            }
-                            final_msg_ts = driver_time_accumulator_ - driver_stream_baseline_;
-                        }
-
+                        const double final_msg_ts = calculateTimestamp(fmt, buffer_qpc_ts);
                         ump_parser_.process(payload, byte_count, umpMessageQueue_, info_.name, final_msg_ts, ump_callback_signal_event_.get());
 
                         const ULONG aligned_size = KS_ALIGN_UP(sizeof(KSMUSICFORMAT) + byte_count, 8);
